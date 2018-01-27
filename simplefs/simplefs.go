@@ -17,8 +17,11 @@ import (
 	"github.com/keybase/client/go/logger"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfscrypto"
+	"github.com/keybase/kbfs/libfs"
 	"github.com/keybase/kbfs/libkbfs"
 	"github.com/keybase/kbfs/tlf"
+	billy "gopkg.in/src-d/go-billy.v4"
+	"gopkg.in/src-d/go-billy.v4/osfs"
 )
 
 const (
@@ -660,22 +663,23 @@ func (k *SimpleFS) SimpleFSWait(ctx context.Context, opid keybase1.OpID) error {
 }
 
 // remotePath decodes a remote path for us.
-func remotePath(path keybase1.Path) (ps []string, t tlf.Type, err error) {
+func remotePath(path keybase1.Path) (
+	t tlf.Type, tlfName, restOfPath string, err error) {
 	pt, err := path.PathType()
 	if err != nil {
-		return nil, tlf.Private, err
+		return tlf.Private, "", "", err
 	}
 	if pt != keybase1.PathType_KBFS {
-		return nil, tlf.Private, errOnlyRemotePathSupported
+		return tlf.Private, "", "", errOnlyRemotePathSupported
 	}
 	raw := path.Kbfs()
 	if raw != `` && raw[0] == '/' {
 		raw = raw[1:]
 	}
-	ps = strings.Split(raw, `/`)
+	ps := strings.Split(raw, `/`)
 	switch {
 	case len(ps) < 2:
-		return nil, tlf.Private, errInvalidRemotePath
+		return tlf.Private, "", "", errInvalidRemotePath
 	case ps[0] == `private`:
 		t = tlf.Private
 	case ps[0] == `public`:
@@ -683,10 +687,36 @@ func remotePath(path keybase1.Path) (ps []string, t tlf.Type, err error) {
 	case ps[0] == `team`:
 		t = tlf.SingleTeam
 	default:
-		return nil, tlf.Private, errInvalidRemotePath
+		return tlf.Private, "", "", errInvalidRemotePath
 
 	}
-	return ps[1:], t, nil
+	return t, ps[1], stdpath.Join(ps[2:]), nil
+}
+
+func (k *SimpleFS) getFS(ctx context.Context, path keybase1.Path) (
+	fs billy.FS, err error) {
+	pt, err := path.PathType()
+	if err != nil {
+		return nil, err
+	}
+	switch pt {
+	case keybase1.PathType_KBFS:
+		t, tlfName, restOfPath, err := remotePath(path)
+		if err != nil {
+			return nil, err
+		}
+		tlfHandle, err := libkbfs.GetHandleFromFolderNameAndType(
+			ctx, k.config.KBPKI(), k.config.MDOps(), tlfName, t)
+		if err != nil {
+			return nil, err
+		}
+		return libfs.NewFS(
+			ctx, k.config, tlfHandle, restOfPath, "", keybase1.MDPriorityNormal)
+	case keybase1.PathType_LOCAL:
+		return osfs.New(path.Local())
+	default:
+		return nil, simpleFSError{"Invalid path type"}
+	}
 }
 
 func (k *SimpleFS) open(ctx context.Context, dest keybase1.Path, f keybase1.OpenFlags) (
@@ -720,46 +750,6 @@ func (k *SimpleFS) open(ctx context.Context, dest keybase1.Path, f keybase1.Open
 	}
 
 	return node, ei, err
-}
-
-// getRemoteRootNode
-func (k *SimpleFS) getRemoteRootNode(ctx context.Context, path keybase1.Path) (
-	libkbfs.Node, libkbfs.EntryInfo, []string, error) {
-	ps, t, err := remotePath(path)
-	if err != nil {
-		return nil, libkbfs.EntryInfo{}, nil, err
-	}
-	tlf, err := libkbfs.ParseTlfHandlePreferred(
-		ctx, k.config.KBPKI(), k.config.MDOps(), ps[0], t)
-	if err != nil {
-		return nil, libkbfs.EntryInfo{}, nil, err
-	}
-	node, ei, err := k.config.KBFSOps().GetOrCreateRootNode(
-		ctx, tlf, libkbfs.MasterBranch)
-	if err != nil {
-		return nil, libkbfs.EntryInfo{}, nil, err
-	}
-	return node, ei, ps[1:], nil
-}
-
-// getRemoteNode
-func (k *SimpleFS) getRemoteNode(ctx context.Context, path keybase1.Path) (
-	libkbfs.Node, libkbfs.EntryInfo, error) {
-	node, ei, ps, err := k.getRemoteRootNode(ctx, path)
-	if err != nil {
-		return nil, libkbfs.EntryInfo{}, err
-	}
-
-	// TODO: should we walk symlinks here?
-	// Some callers like List* don't want that.
-	for _, name := range ps {
-		node, ei, err = k.config.KBFSOps().Lookup(ctx, node, name)
-		if err != nil {
-			return nil, libkbfs.EntryInfo{}, err
-		}
-	}
-
-	return node, ei, nil
 }
 
 // getRemoteNodeParent
