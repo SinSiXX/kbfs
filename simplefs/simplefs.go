@@ -108,6 +108,11 @@ func (k *SimpleFS) SimpleFSList(ctx context.Context, arg keybase1.SimpleFSListAr
 		case rawPath == `/team`:
 			children, err = k.favoriteList(ctx, arg.Path, tlf.SingleTeam)
 		default:
+			fs, err := k.getFS(arg.Path)
+			if err != nil {
+				return err
+			}
+
 			node, ei, err := k.getRemoteNode(ctx, arg.Path)
 			if err != nil {
 				return err
@@ -664,13 +669,13 @@ func (k *SimpleFS) SimpleFSWait(ctx context.Context, opid keybase1.OpID) error {
 
 // remotePath decodes a remote path for us.
 func remotePath(path keybase1.Path) (
-	t tlf.Type, tlfName, restOfPath string, err error) {
+	t tlf.Type, tlfName, middlePath, finalElem string, err error) {
 	pt, err := path.PathType()
 	if err != nil {
-		return tlf.Private, "", "", err
+		return tlf.Private, "", "", "", err
 	}
 	if pt != keybase1.PathType_KBFS {
-		return tlf.Private, "", "", errOnlyRemotePathSupported
+		return tlf.Private, "", "", "", errOnlyRemotePathSupported
 	}
 	raw := path.Kbfs()
 	if raw != `` && raw[0] == '/' {
@@ -679,7 +684,7 @@ func remotePath(path keybase1.Path) (
 	ps := strings.Split(raw, `/`)
 	switch {
 	case len(ps) < 2:
-		return tlf.Private, "", "", errInvalidRemotePath
+		return tlf.Private, "", "", "", errInvalidRemotePath
 	case ps[0] == `private`:
 		t = tlf.Private
 	case ps[0] == `public`:
@@ -687,32 +692,42 @@ func remotePath(path keybase1.Path) (
 	case ps[0] == `team`:
 		t = tlf.SingleTeam
 	default:
-		return tlf.Private, "", "", errInvalidRemotePath
+		return tlf.Private, "", "", "", errInvalidRemotePath
 
 	}
-	return t, ps[1], stdpath.Join(ps[2:]), nil
+	finalElem = ps[len(ps)-1]
+	return t, ps[1], stdpath.Join(ps[2 : len(ps)-1]...), finalElem, nil
 }
 
 func (k *SimpleFS) getFS(ctx context.Context, path keybase1.Path) (
-	fs billy.FS, err error) {
+	fs billy.FS, finalElem string, err error) {
 	pt, err := path.PathType()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	switch pt {
 	case keybase1.PathType_KBFS:
-		t, tlfName, restOfPath, err := remotePath(path)
+		t, tlfName, restOfPath, finalElem, err := remotePath(path)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		tlfHandle, err := libkbfs.GetHandleFromFolderNameAndType(
 			ctx, k.config.KBPKI(), k.config.MDOps(), tlfName, t)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return libfs.NewFS(
+		fs, err := libfs.NewFS(
 			ctx, k.config, tlfHandle, restOfPath, "", keybase1.MDPriorityNormal)
+		if err != nil {
+			return nil, "", err
+		}
+		return fs, finalElem, nil
 	case keybase1.PathType_LOCAL:
+		// XXX: Can windows get a native path here?
+		ps := strings.Split(path.Local(), `/`)
+		if len(ps) == 1 {
+			osfs.New()
+		}
 		return osfs.New(path.Local())
 	default:
 		return nil, simpleFSError{"Invalid path type"}
