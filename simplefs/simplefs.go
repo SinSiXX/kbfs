@@ -463,15 +463,34 @@ func (k *SimpleFS) SimpleFSRename(ctx context.Context, arg keybase1.SimpleFSRena
 	}
 	defer func() { k.doneSyncOp(ctx, err) }()
 
-	snode, sleaf, err := k.getRemoteNodeParent(ctx, arg.Src)
+	// Get root FS, to be shared by both src and dst.
+	t, tlfName, restOfSrcPath, finalSrcElem, err := remotePath(arg.Src)
 	if err != nil {
 		return err
 	}
-	dnode, dleaf, err := k.getRemoteNodeParent(ctx, arg.Dest)
+	tlfHandle, err := libkbfs.GetHandleFromFolderNameAndType(
+		ctx, k.config.KBPKI(), k.config.MDOps(), tlfName, t)
 	if err != nil {
 		return err
 	}
-	err = k.config.KBFSOps().Rename(ctx, snode, sleaf, dnode, dleaf)
+	fs, err := libfs.NewFS(
+		ctx, k.config, tlfHandle, "", "", keybase1.MDPriorityNormal)
+	if err != nil {
+		return err
+	}
+
+	// Make sure src and dst share the same TLF.
+	tDst, tlfNameDst, restOfDstPath, finalDstElem, err := remotePath(arg.Dest)
+	if err != nil {
+		return err
+	}
+	if tDst != t || tlfName != tlfNameDst {
+		return simpleFSError{"Cannot rename across top-level folders"}
+	}
+
+	err = fs.Rename(
+		fs.Join(restOfSrcPath, finalSrcElem),
+		fs.Join(restOfDstPath, finalDstElem))
 	return err
 }
 
@@ -653,8 +672,16 @@ func (k *SimpleFS) SimpleFSStat(ctx context.Context, path keybase1.Path) (_ keyb
 	}
 	defer func() { k.doneSyncOp(ctx, err) }()
 
-	_, ei, err := k.getRemoteNode(ctx, path)
-	return wrapStat(ei, err)
+	fs, finalElem, err := k.getFS(ctx, path)
+	if err != nil {
+		return keybase1.Dirent{}, err
+	}
+	fi, err := fs.Stat(finalElem)
+	if err != nil {
+		return keybase1.Dirent{}, err
+	}
+
+	return wrapStat(fi, err)
 }
 
 // SimpleFSMakeOpid - Convenience helper for generating new random value
@@ -751,71 +778,12 @@ func (k *SimpleFS) SimpleFSWait(ctx context.Context, opid keybase1.OpID) error {
 	return err
 }
 
-func (k *SimpleFS) open(ctx context.Context, dest keybase1.Path, f keybase1.OpenFlags) (
-	libkbfs.Node, libkbfs.EntryInfo, error) {
-	var node libkbfs.Node
-	var ei libkbfs.EntryInfo
-
-	parent, name, err := k.getRemoteNodeParent(ctx, dest)
-	if err != nil {
-		return node, ei, err
-	}
-
-	// On REPLACE return existing results and if it is a file then truncate it.
-	// TODO: What are the desired semantics on non-matching types?
-	if f&keybase1.OpenFlags_REPLACE != 0 {
-		node, ei, err = k.config.KBFSOps().Lookup(ctx, parent, name)
-		if err == nil {
-			if ei.Type != libkbfs.Dir {
-				err = k.config.KBFSOps().Truncate(ctx, node, 0)
-			}
-			return node, ei, err
-		}
-	}
-	switch {
-	case (f&keybase1.OpenFlags_EXISTING == 0) && (f&keybase1.OpenFlags_DIRECTORY == keybase1.OpenFlags_DIRECTORY):
-		node, ei, err = k.config.KBFSOps().CreateDir(ctx, parent, name)
-	case f&keybase1.OpenFlags_EXISTING == 0:
-		node, ei, err = k.config.KBFSOps().CreateFile(ctx, parent, name, false, false)
-	default:
-		node, ei, err = k.config.KBFSOps().Lookup(ctx, parent, name)
-	}
-
-	return node, ei, err
-}
-
-// getRemoteNodeParent
-func (k *SimpleFS) getRemoteNodeParent(ctx context.Context, path keybase1.Path) (
-	libkbfs.Node, string, error) {
-	node, _, ps, err := k.getRemoteRootNode(ctx, path)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if len(ps) == 0 {
-		return node, "", nil
-	}
-
-	leaf := ps[len(ps)-1]
-	ps = ps[:len(ps)-1]
-
-	// TODO: should we walk symlinks here?
-	for _, name := range ps {
-		node, _, err = k.config.KBFSOps().Lookup(ctx, node, name)
-		if err != nil {
-			return nil, "", err
-		}
-	}
-
-	return node, leaf, nil
-}
-
-func wrapStat(ei libkbfs.EntryInfo, err error) (keybase1.Dirent, error) {
+func wrapStat(fi os.FileInfo, err error) (keybase1.Dirent, error) {
 	if err != nil {
 		return keybase1.Dirent{}, err
 	}
 	var de keybase1.Dirent
-	setStat(&de, &ei)
+	setStat(&de, fi)
 	return de, nil
 }
 
