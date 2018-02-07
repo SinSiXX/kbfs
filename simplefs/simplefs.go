@@ -119,7 +119,10 @@ func remotePath(path keybase1.Path) (
 
 	}
 	finalElem = ps[len(ps)-1]
-	return t, ps[1], stdpath.Join(ps[2 : len(ps)-1]...), finalElem, nil
+	if len(ps) >= 3 {
+		middlePath = stdpath.Join(ps[2 : len(ps)-1]...)
+	}
+	return t, ps[1], middlePath, finalElem, nil
 }
 
 func (k *SimpleFS) getFS(ctx context.Context, path keybase1.Path) (
@@ -551,7 +554,6 @@ func (k *SimpleFS) SimpleFSOpen(ctx context.Context, arg keybase1.SimpleFSOpenAr
 		libfs = libfs.WithContext(fsCtx)
 		k.log.CDebugf(ctx, "New background context for open: SFSID=%s, OpID=%X",
 			fsCtx.Value(ctxIDKey), arg.OpID)
-		ctx = fsCtx
 		fs = libfs
 	}
 
